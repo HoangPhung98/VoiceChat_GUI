@@ -1,0 +1,3 @@
+﻿  Client_A.cpp
+C:\Users\PhungVanHoang\source\repos\TextChat_P2P_GUI\Client_A.cpp(79): warning C4244: 'argument': conversion from 'time_t' to 'unsigned int', possible loss of data
+  TextChat_P2P_GUI.vcxproj -> C:\Users\PhungVanHoang\source\repos\TextChat_P2P_GUI\Debug\Client_A.exe
