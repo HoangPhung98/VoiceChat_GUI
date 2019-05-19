@@ -8,9 +8,23 @@
 #include <WinSock2.h>
 #pragma comment(lib,"ws2_32.lib")
 #include <WS2tcpip.h>
-
+//sfml
+#include <SFML/Audio.hpp>
+#include <atomic>
+#include <cassert>
+#include <mutex>
+#include <queue>
+//sfml
+//===============================================================================================================
+//<<<const
 #define MAX_LOADSTRING 100
-//TAG
+#define SERVER_IP "192.168.0.101"
+#define PORT_CLIENT_A 8000
+#define PORT_CLIENT_B 8500
+#define PORT_SERVER 9000
+
+//const>>>
+//<<<TAG
 #define SIZE_OF_BUFF 1024
 #define SIZE_OF_BUFF_FROM_SERVER 128
 #define LOGIN "LOGIN"
@@ -27,32 +41,145 @@
 #define DECLINE_FROM "DECLINE_FROM"
 #define UPDATE_LIST_ONLINE_USER_START "UPDATE_LIST_ONLINE_USER_START"
 #define UPDATE_LIST_ONLINE_USER_DOING "UPDATE_LIST_ONLINE_USER_DOING"
+//TAG>>>
+//==========================================================================================================
 
-#define PORT_CLIENT_A 8000
-#define PORT_CLIENT_B 8500
-#define PORT_SERVER 9000
 
-//Prototype
+//<<<Prototype
 DWORD WINAPI ReceiverFromServerThread(LPVOID);
 DWORD WINAPI ReceiverFromFriendThread(LPVOID);
+DWORD WINAPI SendDataThread(LPVOID lpParam);
 DWORD WINAPI ReadKeyBoardThread(LPVOID);
 void callUDP_P2P();
 void changeWindowBaseOnParentWindowPosition(HWND, HWND);
+//Prototype>>>
 
+//<<<Struct
+struct Samples {
+	Samples(sf::Int16 const* ss, std::size_t count) {
+		samples.reserve(count);
+		std::copy_n(ss, count, std::back_inserter(samples));
+	}
 
-// Global Variables:
+	Samples() {}
+
+	std::vector<sf::Int16> samples;
+};
+//Struct>>>
+
+//<<< Global Variables:
+	//sfml: audio vars
+		std::atomic<bool> isRecording{ false };
+		std::mutex mutex_recv, mutex_send; // protects `data`
+		std::condition_variable cv_recv, cv_send; // notify consumer thread of new samples
+		std::queue<Samples> data_recv;
+		std::queue<Samples> data_send; // samples come in from the recorder, and popped by the output stream
+		Samples playingSamples, sendingSamples; // used by the output stream.
+	//sfml: audio vars
+
+	//win32app 
 HINSTANCE hInst;                                // current instance
 WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
 WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
 HWND loginWnd, listOnlWnd, callFromWnd, inTheCallWnd;
-int myRandomPort;
-char myUser[128];
+	//win32app>>>
 
+	//winsock
 WSADATA wsa;
 SOCKET p2p, client_to_server;
 SOCKADDR_IN friendaddr, myaddr, serveraddr;
+	//winsock>>>
 char friendUserName[32], myIP[32], myPort[32];
+int myRandomPort;
+char myUser[128];
 bool isCallingToFriend = false;
+//Global Vars>>>
+//============================================================================================================
+
+//<<OVERWRITE Class
+class MyRecorder : public sf::SoundRecorder {
+public: /** API **/
+
+	// Initialise capturing input & setup output
+	void start() {
+		sf::SoundRecorder::start();
+	}
+
+	// Stop both recording & playback
+	void stop() {
+		sf::SoundRecorder::stop();
+	}
+
+	bool isRunning() { return isRecording; }
+
+
+	~MyRecorder() {
+		stop();
+	}
+
+
+protected: /** OVERRIDING SoundRecorder **/
+
+	bool onProcessSamples(sf::Int16 const* samples, std::size_t sampleCount) override {
+		{
+			std::lock_guard<std::mutex> lock(mutex_send);
+			data_send.emplace(samples, sampleCount);
+		}
+		cv_send.notify_one();
+		return true; // continue capture
+	}
+
+	bool onStart() override {
+		isRecording = true;
+		return true;
+	}
+
+	void onStop() override {
+		isRecording = false;
+		cv_send.notify_one();
+	}
+};
+class MyStream : private sf::SoundStream {
+public:
+	void initialize(unsigned int channelCount, unsigned int sampleRate) {
+		sf::SoundStream::initialize(channelCount, sampleRate);
+	}
+	void play() {
+		sf::SoundStream::play();
+	}
+	void stop() {
+		sf::SoundStream::stop();
+	}
+protected: /** OVERRIDING SoundStream **/
+
+	bool onGetData(Chunk& chunk) override {
+		// Wait until either:
+		//  a) the recording was stopped
+		//  b) new data is available
+		std::unique_lock<std::mutex> lock2(mutex_recv);
+		cv_recv.wait(lock2);
+
+		// Lock was acquired, examine which case we're into:
+		if (!isRecording) return false;
+		else
+		{
+			assert(!data_recv.empty());
+			playingSamples.samples = std::move(data_recv.front().samples);
+			data_recv.pop();
+			//std::cout << "*******size" << playingSamples.samples.size() << "\n";
+			chunk.sampleCount = playingSamples.samples.size();
+			chunk.samples = playingSamples.samples.data();
+			return true;
+		}
+	}
+	void onSeek(sf::Time) override { /* Not supported, silently does nothing. */ }
+
+private:
+};
+//OVERWRITE Class>>>
+//==========================================================================================================
+MyRecorder myRecorder;
+MyStream myStream;
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -89,14 +216,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	friendaddr.sin_family = AF_INET;
 
 	//sockaddr for socket that listen from server
-	serveraddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+	serveraddr.sin_addr.s_addr = inet_addr(SERVER_IP);
 	serveraddr.sin_family = AF_INET;
 	serveraddr.sin_port = htons(PORT_SERVER);
 	connect(client_to_server, (SOCKADDR*)& serveraddr, sizeof(SOCKADDR_IN));
 
+
 //**init 1 thread one to recv data from Server, one for reading keyboard typing
 	CreateThread(0, 0, ReceiverFromServerThread, 0, 0, 0);
-
     // Initialize global strings
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_TEXTCHATP2PGUI, szWindowClass, MAX_LOADSTRING);
@@ -127,6 +254,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     return (int) msg.wParam;
 }
 
+//===============================================================================================================
 
 
 //
@@ -249,6 +377,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 //  WM_DESTROY  - post a quit message and return
 //
 //
+
+//===============================================================================================================
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	int i = 0;
@@ -398,6 +529,14 @@ DWORD WINAPI ReceiverFromServerThread(LPVOID lpParam) {
 
 DWORD WINAPI ReceiverFromFriendThread(LPVOID lpParam) {
 	int ret;
+	sf::Int16 buff[10000];
+	while (true) {
+		ret = recvfrom(p2p, (char*)buff, sizeof(buff), 0, NULL, NULL);
+		std::lock_guard<std::mutex> lock2(mutex_recv);
+		data_recv.emplace(buff, ret / 2);
+		cv_recv.notify_one();	
+	}
+	/*int ret;
 	char buff[SIZE_OF_BUFF];
 	while (true) {
 		ret = recvfrom(p2p, buff, sizeof(buff), 0, NULL, NULL);
@@ -406,13 +545,39 @@ DWORD WINAPI ReceiverFromFriendThread(LPVOID lpParam) {
 			buff[ret] = 0;
 			SetDlgItemTextA(inTheCallWnd, IDC_EDIT_TEXT_STATIC_IN_THE_CALL, buff);
 		}
-	}
+	} //pre: this was belong to text chat*/
 }
+DWORD WINAPI SendDataThread(LPVOID lpParam) {
+	int size = sizeof(sf::Int16);
+	while (true) {
+		std::unique_lock<std::mutex> lock1(mutex_send);
+		cv_send.wait(lock1);
+		// Lock was acquired, examine which case we're into:
+		if (!isRecording) return false;
+		else
+		{
+			assert(!data_send.empty());
+			sendingSamples.samples = std::move(data_send.front().samples);
+			data_send.pop();
+			sendto(p2p, (char*)(sendingSamples.samples.data()), sendingSamples.samples.size() * size, 0, (SOCKADDR*)& friendaddr, sizeof(SOCKADDR));
+		}
+	}
 
+}
 void callUDP_P2P() {
 	isCallingToFriend = true;
 	//create listener from client friend
 	bind(p2p, (SOCKADDR*)& myaddr, sizeof(SOCKADDR));
+
+	//create thread that recv audio from friend and push to data queue
+	CreateThread(0, 0, ReceiverFromFriendThread, &p2p, 0, 0);
+
+	//init recorder to record from device, stream to playback audio that recved from friend
+	myRecorder.start();
+	CreateThread(0, 0, SendDataThread, &p2p, 0, 0);
+	
+	myStream.initialize(myRecorder.getChannelCount(), myRecorder.getSampleRate());
+	myStream.play();
 	CreateThread(0, 0, ReceiverFromFriendThread, &p2p, 0, 0);
 }
 void changeWindowBaseOnParentWindowPosition(HWND parent, HWND current) {
@@ -425,7 +590,7 @@ void changeWindowBaseOnParentWindowPosition(HWND parent, HWND current) {
 	UpdateWindow(parent);
 	UpdateWindow(current);
 }
-
+//===============================================================================================================
 
 // Message handler for about box.
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
@@ -446,6 +611,4 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
     }
     return (INT_PTR)FALSE;
 }
-
-
 //TODO: Change port and ip of server
